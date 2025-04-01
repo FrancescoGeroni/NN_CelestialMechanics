@@ -1,4 +1,13 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[375]:
+
+
 #reset -f
+
+
+# In[376]:
 
 
 import torch
@@ -10,13 +19,22 @@ import matplotlib.pyplot as plt
 from pyDOE import lhs 
 
 
+# In[377]:
+
+
 torch.manual_seed(1234)
 np.random.seed(1234)
+
+
+# In[378]:
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 print(f"Working on {device}")
+
+
+# In[379]:
 
 
 def batch_generator(x, t, y, batch_size, dev = device):   
@@ -35,6 +53,9 @@ def batch_generator(x, t, y, batch_size, dev = device):
         
         # Yield the batch
         yield batch_x, batch_t, batch_y
+
+
+# In[380]:
 
 
 #functions for data handling
@@ -58,6 +79,9 @@ def standardize(inputs):
 def destandardize(inputs):
     
     return  inputs*inputs.std() + inputs.mean()
+
+
+# In[381]:
 
 
 #Gets the untouched datas and conditions points numbers and returns the handled data ready for training
@@ -103,13 +127,13 @@ def data_handler(x, t, y, n_ic, n_bc, n_domain):
     # Boundary Conditions (normalization builtin)
     idx_t_lb = np.random.choice(t.shape[0], int(n_bc/2), replace=False)
     BC_1_x_t = np.column_stack((x_norm, np.ones(t.shape[0]) * t_norm[0]))[idx_t_lb]
-    BC_1_y = np.ones(t.shape[0]) * np.min(y_true_norm[0,:]) # #exactSolution(BC_1_x_t[:,1], BC_1_x_t[:,0]) 
-    BC_1_y = BC_1_y[idx_t_lb, None]
+    BC_1_y = y_true_norm[0, :]
+    BC_1_y = BC_1_y[idx_t_lb, None] 
 
     idx_t_ub = np.random.choice(t.shape[0], int(n_bc/2), replace=False)
     BC_2_x_t = np.column_stack((x_norm, np.ones(t.shape[0]) * t_norm[-1]))[idx_t_ub]
-    BC_2_y = np.ones(t.shape[0]) * np.max(y_true_norm[-1,:]) #np.max(y_true_norm[-1,:])  #exactSolution(BC_2_x_t[:,1], BC_2_x_t[:,0]) #
-    BC_2_y = BC_2_y[idx_t_ub, None]
+    BC_2_y = y_true_norm[-1, :] 
+    BC_2_y = BC_2_y[idx_t_ub, None] 
 
     # Create collocation points with latin hypercube sampling
     X_T_domain = lb + (ub - lb) * lhs(2, n_domain)
@@ -157,8 +181,12 @@ def data_handler(x, t, y, n_ic, n_bc, n_domain):
     return x0, t0, y0, x_lb, t_lb, y_lb, x_ub, t_ub, y_ub, x_domain, t_domain, y_domain, x_norm, t_norm, y_true_norm
 
 
+# In[382]:
+
+
 class PINN(nn.Module):
-    def __init__(self, layers, losstype,
+    def __init__(self, 
+                 layers, losstype, n_batch,
                  t0, x0, y0, 
                  t_lb, x_lb, y_lb, 
                  t_ub, x_ub, y_ub, 
@@ -169,27 +197,31 @@ class PINN(nn.Module):
         self.activation = nn.Tanh() # ACTIVATION function
         self.layers = layers
         self.losstype = losstype
-
+        self.n_batch = n_batch
+        
+        #self.T_weight = nn.Tensor.ones(self.n_batch)
+        
         #self.linears = nn.ModuleList([nn.Linear(layers[i], layers[i+1]) for i in range(len(layers)-1)]) # layer structure (INCLUDES Glorot-Xavier inizialization)
-
         
         self.linears = nn.ModuleList()
         
-        for i in range(len(layers) - 1):
+        for i in range(len(layers) - 1): #Create layers
             self.linears.append(nn.Linear(layers[i], layers[i+1]))  # Fully connected layer
-            # Add a dropout layer after each linear layer, except the last one
-            if i < len(layers) - 2:  # Avoid dropout on the last layer
-                self.linears.append(nn.Dropout(0.2))
+            
+            # Add dropout layers
+            if i < (len(layers) - 2):  # Avoid dropout on the output layer
+                self.linears.append(nn.Dropout(0.0000000001)) # p = probability of nullify each element of the tensor
+
         
         self.s_list = {}
         self.v_list = {}
    
-        for i in range(0, len(self.linears), 2): #(Here we can set specific bias and weights, like a modified Glorot-Xavier inizialization)
-            n = self.linears[i].in_features
-            gx = 2 / np.sqrt(n)
-            self.linears[i].weight.data.normal_(0, gx) # 
-            self.linears[i].bias.data.fill_(0) # b =  
-
+        for i in range(0, len(self.linears), 2): #(modified Glorot-Xavier inizialization + random weight factorization memorization)
+            #n = self.linears[i].in_features
+            #gx = 1 / np.sqrt(n)
+            #self.linears[i].weight.data.normal_(0, gx) 
+            #self.linears[i].bias.data.fill_(0)
+            
             mean = 1.0
             std = 0.1
         
@@ -204,6 +236,7 @@ class PINN(nn.Module):
             v = w / s
             self.v_list[f"v_{i}"] = nn.Parameter(v, requires_grad=True)
             self.register_parameter(f"v_{i}", self.v_list[f"v_{i}"]) # Register the parameter
+        
         
         self.t0 = t0
         self.x0 = x0
@@ -246,32 +279,40 @@ class PINN(nn.Module):
         self.train_loss_history = []
 
     
-    def factorize_weights(self, i):        
-        
+    def get_factorized_weight(self, i):        
         b = self.linears[i].bias
 
         s = self.s_list[f"s_{i}"]
         v = self.v_list[f"v_{i}"]
         
         return s * v, b
-
     
-    def forward(self, X): # Forward pass using decomposed weights
+    
+    def forward(self, X): # Forward pass using decomposed weights with dropout and skip connections
         a = X.float()
-
-        #With Droput layers
-        for i in range(0, len(self.linears), 2):  # Skip the dropout layers
-            kernel, b = self.factorize_weights(i)
-            
-            #with torch.no_grad():
-               #self.linears[i].weight.copy_(kernel)
-                
-            a = torch.matmul(a, kernel.T) + b  
-            
-            if i < (len(self.linears) - 1):  # Apply activation + dropout only for hidden layers
-                a = self.activation(a)  # Apply activation function
-                a = self.linears[i+1](a)  # Apply dropout layer (only on hidden layers)
         
+        for i in range(0, len(self.linears), 2):  # Skip the dropout layers
+            
+            a_prev = a
+            
+            kernel, b = self.get_factorized_weight(i)
+            a = torch.matmul(a_prev, kernel.T) + b  
+
+            #a = self.linears[i](a_prev)
+            
+            #Apply activation + dropout only for hidden layers
+            if i < (len(self.linears) - 1):  
+                a = self.activation(a)
+                a = self.linears[i+1](a)
+                
+                if 0 < i : #Skip connections are activated only after the input layer, included the output
+                    if a.shape != a_prev.shape: #In case of layers of different size
+                    # Apply a 1x1 linear transformation to match dimensions, but after activation
+                        projection = nn.Linear(a_prev.shape[1], a.shape[1], bias=False).to(a.device)
+                        a_prev = projection(a_prev) 
+                    
+                    a += a_prev
+
         return a
         
     
@@ -290,17 +331,18 @@ class PINN(nn.Module):
         return f
 
     
-    def get_derivative(self, y, x, n): # (n is the order if the derivative)
-        # General formula to compute the n-th order derivative of y = f(x) with respect to x
-        if n == 0:
+    def get_derivative(self, y, x, n): # General formula to compute the n-th order derivative of y = f(x) with respect to x
+        if n == 0:  # (n is the order if the derivative)
             return y
         else:
             dy_dx = torch.autograd.grad(y, x, torch.ones_like(y).to(device), create_graph=True, retain_graph=True, allow_unused=True)[0]
         
         return self.get_derivative(dy_dx, x, n - 1)
 
-
-    def loss_IC(self):
+    '''
+    Creating the additional losses terms given the Lagrange planetary equations
+    '''
+    def loss_IC(self): 
         y_pred_IC = self.network_prediction(self.batch_t0, self.batch_x0)
         
         if self.losstype == 'mse':
@@ -360,6 +402,14 @@ class PINN(nn.Module):
         elif self.losstype == 'logcosh':
             loss_interior = torch.mean(torch.log(torch.cosh(f_pred))).to(device)
             
+        '''
+        eps = 0.7 # T_weight slope: recommended eps = 1
+
+        loss_interior = torch.mean(self.T_weight*torch.log(torch.cosh(f_pred))).to(device)
+
+        for i in range(1, self.n_batch):
+            self.T_weight[i] = torch.exp(-eps*torch.sum(loss_interior[1:i]))
+        '''        
         return loss_interior
 
     
@@ -425,7 +475,7 @@ class PINN(nn.Module):
                 loss_BC_batch_ub = self.loss_BC(1) # 1 for upper bound
                 loss_BC += loss_BC_batch_ub
             
-            # Mini-batch training for Domain Loss (interior)
+            # Mini-batch training for Domain Loss (interior) and update temporal weights
             for self.batch_x_domain, self.batch_t_domain, self.batch_y_domain in batch_generator(self.x_domain, self.t_domain, self.y_domain, batch_size): 
                 loss_domain_batch = self.loss_interior()
                 loss_domain += loss_domain_batch
@@ -438,17 +488,25 @@ class PINN(nn.Module):
                 # Total loss for this epoch
                 total_loss = loss_IC + loss_BC + loss_domain + loss_BC_symmetric  
                 self.train_loss_history.append([total_loss.cpu().detach(), loss_IC.cpu().detach(), loss_BC.cpu().detach(), loss_domain.cpu().detach(), loss_BC_symmetric.cpu().detach()]) #, 
-                
+                             
+                self.optimizer.zero_grad()
+
+                # Calculate gradients
                 total_loss.backward()
+                
+                if epoch % 100 == 0:
+                    print(self.s_list[f"s_{0}"].grad)
+                    #print(self.linears[0].weight.grad)
+                
                 # Optimize the network parameters
                 self.optimizer.step() 
-                self.optimizer.zero_grad()
                 
             else:
                 # Total loss for this epoch
                 total_loss = loss_IC  + loss_BC + loss_domain + loss_BC_symmetric  
                 self.train_loss_history.append([total_loss.cpu().detach(), loss_IC.cpu().detach(), loss_BC.cpu().detach(), loss_domain.cpu().detach(), loss_BC_symmetric.cpu().detach()]) #, loss_BC.cpu().detach()
-                
+
+                self.optimizer.zero_grad()
                 total_loss.backward(retain_graph=True)
                 # Optimize the network parameters (with closure)
                 self.optimizer.step(self.closuring)
@@ -458,39 +516,57 @@ class PINN(nn.Module):
                 print(f'Epoch ({optim}): {epoch}, Total Loss: {total_loss.detach().cpu().numpy()}')
 
 
+# In[383]:
+
 
 def exactSolution(t, x):
     
     return np.power(x, 2) + 1
+    
+x_len = 100
+t_len = 100
 
-x = np.linspace(-5, 5, 100).reshape(-1,1) # Space domain (must be same space as time one (for shuffle purposes))
-t = np.linspace(0, 5, 100).reshape(-1,1) # Time domain
+'''
+x = np.random.uniform(-5, 5, x_len)
+x = np.sort(x)
+x = x.reshape(-1,1)
+
+t = np.random.uniform(0, 5, t_len)
+t = np.sort(t)
+t = t.reshape(-1,1)
+'''
+
+x = np.linspace(-5, 5, x_len).reshape(-1,1) # Space domain (must be same space as time one (for shuffle purposes))
+t = np.linspace(0, 5, t_len).reshape(-1,1) # Time domain
 
 X, T = np.meshgrid(x[:, 0], t[:, 0]) 
 
 y_true = exactSolution(T, X) # NOT normalized and NOT reshuffled
 
 
-#print(model.parameters)
+# In[384]:
 
 
-layers = [2, 128, 128, 128, 1] #[2, 8, 16, 8, 32, 8, 16, 8, 1]
+layers = [2, 64, 64, 64, 1] #[2, 8, 16, 8, 32, 8, 16, 8, 1]
 losstype = 'mse'
-
-x0, t0, y0, x_lb, t_lb, y_lb, x_ub, t_ub, y_ub, x_domain, t_domain, y_domain, x_norm, t_norm, y_norm = data_handler(x, t, y_true, 100, 200, 8000)
-
-model = PINN(layers, losstype, t0, x0, y0, t_lb, x_lb, y_lb, t_ub, x_ub, y_ub, t_domain, x_domain, y_domain, x_norm, t_norm, y_norm).to(device)
-
-#model.apply(weights_init_Glorot_Xavier)
-
-
-epochs = 1000
-L_rate = 0.0001
-lambda_reg = 0 #0.00002
 n_batch = 64
+epochs = 1000
+L_rate = 0.0002
+lambda_reg = 0 #0.00002
 #frac = 4/5
 
+x0, t0, y0, x_lb, t_lb, y_lb, x_ub, t_ub, y_ub, x_domain, t_domain, y_domain, x_norm, t_norm, y_norm = data_handler(x, t, y_true, 100, 200, x_len*t_len)
+
+model = PINN(layers, losstype, n_batch, t0, x0, y0, t_lb, x_lb, y_lb, t_ub, x_ub, y_ub, t_domain, x_domain, y_domain, x_norm, t_norm, y_norm).to(device)
+
+
+# In[ ]:
+
+
 model.train_network(epochs, 'Adam', n_batch, L_rate, lambda_reg) # L-BFGS, AdamW, SGD, ASGD, Adagrad
+
+
+# In[ ]:
 
 
 total_loss, loss_IC, loss_BC, loss_domain, loss_BC_symmetric = model.get_training_history() 
@@ -511,6 +587,9 @@ plt.grid(True)
 plt.show()
 
 
+# In[ ]:
+
+
 '''
 # Get model predictions after training
 x_valid = np.linspace(-5, 5, n_valid).reshape(-1,1) # Space domain (must be same space as time one (for shuffle purposes))
@@ -529,13 +608,29 @@ model_valid.train_network(epochs, 'Adam', n_batch, L_rate, lambda_reg)
 '''
 
 
+# In[ ]:
+
+
 '''
 total_loss_val, loss_IC_val, loss_BC_val, loss_domain_val, loss_BC_symmetric_val = model.get_training_history()
 '''
 
 
+# In[ ]:
+
+
 # Get model predictions after training
-n_valid = 200
+n_valid = 40
+
+'''
+x_valid = np.random.uniform(-5, 5, n_valid)
+x_valid = np.sort(x_valid)
+x_valid = x_valid.reshape(-1,1)
+
+t_valid = np.random.uniform(0, 5, n_valid)
+t_valid = np.sort(t_valid)
+t_valid = t_valid.reshape(-1,1)
+'''
 
 x_valid = np.linspace(-5, 5, n_valid).reshape(-1,1) # Space domain (must be same space as time one (for shuffle purposes))
 t_valid = np.linspace(0, 5, n_valid).reshape(-1,1) # Time domain
@@ -556,10 +651,6 @@ y_true_valid = standardize(y_true_valid)
 
 X_valid, T_valid = np.meshgrid(x_valid[:, 0], t_valid[:, 0])                                                                                                  
 
-#T_valid = T_valid.T # in order to take a correct t_val
-
-#T_valid = T_valid.T
-
 idx = torch.randperm(n_valid)
 #idx_0 = torch.torch.arange(0, 100, 1).int()
 
@@ -568,35 +659,25 @@ t_val = t_valid[idx]
 
 X_val, T_val = np.meshgrid(x_val[:, 0], t_val[:, 0])
 
-t_val = torch.tensor(T_val.flatten(), requires_grad=True).view(-1, 1).float().to(device)
-x_val = torch.tensor(X_val.flatten(), requires_grad=True).view(-1, 1).float().to(device)
+t_pred = torch.tensor(T_val.flatten(), requires_grad=True).view(-1, 1).float().to(device)
+x_pred = torch.tensor(X_val.flatten(), requires_grad=True).view(-1, 1).float().to(device)
 
 # Predict with the trained model
-y_pred = model.network_prediction(t_val, x_val).cpu().detach().numpy()
+y_pred = model.network_prediction(t_pred, x_pred).cpu().detach().numpy()
 
 # Reshape to match the shape of the true values
-y_pred = y_pred.reshape(n_valid, n_valid)
+#y_pred = y_pred.reshape(n_valid, n_valid)
+
+
+
+# In[ ]:
 
 
 '''
 plt.figure(figsize=(10, 8))
-plt.contourf(X_valid, T_valid, y_true_valid, levels=int(n_valid/10), cmap='jet', alpha=0.6)
-plt.colorbar(label='True value')
-#plt.scatter(X_val, T_val, y_pred, alpha=1)
-plt.contour(X_valid, T_valid, y_pred, levels=int(n_valid/10), cmap='jet', alpha=1, linestyles = 'dashed')
-plt.colorbar(label='Solution Value')
-plt.xlabel('x')
-plt.ylabel('t')
-plt.grid(True)
-plt.show()
-'''
-
-
-'''
-plt.figure(figsize=(10, 8))
-plt.contourf(X_valid, T_valid, y_true_valid, levels=50, cmap='jet', alpha=0.7)  # Use alpha for transparency of background
+plt.contourf(X_valid, T_valid, y_true_valid, levels=int(n_valid/2), cmap='jet', alpha=0.7)  # Use alpha for transparency of background
 plt.colorbar(label='Exact solution')
-plt.scatter(X_val, T_val, c=y_pred.flatten(), cmap='jet', s=2, alpha=0.8)
+plt.contour(X_val, T_val, y_pred, levels=int(n_valid/2), cmap='jet', alpha=0.8)
 plt.colorbar(label='Estimated solution')
 plt.xlabel('X (Space Domain)')
 plt.ylabel('T (Time Domain)')
@@ -612,7 +693,7 @@ axes[0].set_ylabel('T')
 fig.colorbar(c1, ax=axes[0], label='Exact solution')
 
 # Subplot 2: Plot only predictions (estimated solution)
-c2 = axes[1].scatter(X_val, T_val, c=y_pred.flatten(), cmap='jet', s=2, alpha=1)
+c2 = axes[1].scatter(X_val, T_val, c=y_pred, cmap='jet', s=n_valid/2, alpha=1)
 axes[1].set_xlabel('X')
 axes[1].set_ylabel('T')
 fig.colorbar(c2, ax=axes[1], label='Estimated solution')
@@ -621,20 +702,17 @@ fig.colorbar(c2, ax=axes[1], label='Estimated solution')
 plt.show()
 
 
+# In[ ]:
+
 
 # Plot Initial conditions and Boundary conditions
 plt.figure(figsize=(10, 6))
-plt.scatter(x0.detach().numpy(), y0.detach().numpy(), color='blue', label='Initial Conditions')
-plt.scatter(x_lb.detach().numpy(), y_lb.detach().numpy(), color='red', label='Lower Boundary Conditions')
-plt.scatter(x_ub.detach().numpy(), y_ub.detach().numpy(), color='green', label='Upper Boundary Conditions')
+plt.scatter(x0.detach().numpy(), t0.detach().numpy(), c=y0.flatten(), cmap='jet')
+plt.scatter(x_lb.detach().numpy(), t_lb.detach().numpy(), c=y_lb.flatten(), cmap='jet')
+plt.scatter(x_ub.detach().numpy(), t_ub.detach().numpy(), c=y_ub.flatten(), cmap='jet')
+plt.colorbar(label='Conditions value')
 plt.xlabel('Position (x)')
-plt.ylabel('Solution (y)')
-plt.legend()
+plt.ylabel('Time (t)')
 plt.grid(True)
 plt.show()
-
-
-
-
-
 
