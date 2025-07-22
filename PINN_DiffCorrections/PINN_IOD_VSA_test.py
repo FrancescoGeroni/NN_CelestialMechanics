@@ -4,7 +4,7 @@
 # In[22]:
 
 
-get_ipython().run_line_magic('reset', '-f')
+#get_ipython().run_line_magic('reset', '-f')
 
 # ==============
 # DEVICE SETUP 
@@ -861,7 +861,7 @@ class PINN_VSA(nn.Module):
 
 
     # ------------------------ Loss functions for the PINN_VSA class --------------------------------------------
-    def negative_rho_penalty(self, out, penalty_weight=1e6): # inputs denormalized
+    def negative_rho_penalty(self, out, penalty_weight=1e4): # inputs denormalized
         out[:,0] = (out[:,0] * L_c) / AU
         negative_rho = -torch.minimum(out[:, 0], torch.tensor(0.0, device=out.device))
 
@@ -891,7 +891,7 @@ class PINN_VSA(nn.Module):
         return loss_IC + penalty
 
 
-    def loss_residuals(self, out, batch_y): # out denormalized, batch_y NOT denormalized and dimensionless
+    def loss_residuals(self, out, batch_y): # out denormalized , batch_y NOT denormalized and dimensionless
         """Compute residual loss using cached network output."""
         batch_y = denormalize(batch_y, self.y_border[0], self.y_border[1])
 
@@ -1395,7 +1395,7 @@ print("Data pre-processing complete.")
 # Network architecture
 layers = [5, 256, 256, 256, 256, 256, 2]  # [input_features, ...hidden_layers..., output_features]
 
-epochs = 100  # Number of training epochs
+epochs = 1000  # Number of training epochs
 lr = 1e-5  # Learning rate for optimizer
 
 # Device-aware training configuration
@@ -1404,7 +1404,7 @@ config = {
     'epochs': epochs,                      # Number of training epochs  
     'learning_rate': lr,                   # Learning rate for optimizer
     'regularization': lr*0,                # L2 regularization for stability
-    'fourier_features': 16,                 # Fourier embedding size
+    'fourier_features': 8,                 # Fourier embedding size
     'fourier_scale': 2.0,                  # Fourier embedding scale
 
     # Device-aware optimization parameters
