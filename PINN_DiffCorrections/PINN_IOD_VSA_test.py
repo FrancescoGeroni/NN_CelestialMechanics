@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[22]:
+# In[34]:
 
 
 #get_ipython().run_line_magic('reset', '-f')
@@ -13,19 +13,20 @@
 # Core libraries
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import time
-import numpy as np
 
 # Progress bar for notebooks
-from tqdm import tqdm 
+from tqdm.notebook import tqdm 
+import time
 
 # Astronomy libraries
 from astropy.time import Time
-from astropy.coordinates import get_body_barycentric
+from astropy.coordinates import get_body_barycentric_posvel
 import astropy.units as u
 
 # Set random seeds for reproducibility
@@ -59,7 +60,7 @@ torch.backends.cudnn.deterministic = False  # Allow non-deterministic for speed
 torch.autograd.set_detect_anomaly(False)    # Disable anomaly detection for speed
 
 
-# In[23]:
+# In[35]:
 
 
 # ===============================================================================
@@ -255,168 +256,129 @@ def equinoctial_to_obs(equin_coord: np.ndarray, r_obs: np.ndarray = np.zeros(3),
 
     return alpha, delta, alpha_dot, delta_dot, rho, rho_dot
 
+def attributable_to_cartesian(att): # (alpha, delta, alpha_dot, delta_dot, rho, rho_dot) --> (r, v)
+    """
+    Convert attributable elements to Cartesian coordinates.
 
-# In[24]:
+    Note: This produces GEOCENTRIC coordinates (Earth-centered).
+    For heliocentric calculations, you need to add Earth's position.
+    """
+    # unit line-of-sight
+    cd, sd = torch.cos(att[:,1]), torch.sin(att[:,1])
+    ca, sa = torch.cos(att[:,0]), torch.sin(att[:,0])
+    rho_hat =  torch.stack([cd*ca, cd*sa, sd], dim=1)
+
+    # partials
+    d_rho_hat_dalpha = torch.stack([-cd*sa, cd*ca, torch.zeros_like(sd)], dim=1)
+    d_rho_hat_ddelta = torch.stack([-sd*ca, -sd*sa, cd], dim=1)
+
+    # time-derivative of rho_hat
+    rho_hat_dot = d_rho_hat_dalpha * att[:,2].unsqueeze(1) + d_rho_hat_ddelta * att[:,3].unsqueeze(1)
+
+    # position and velocity (GEOCENTRIC)
+    r = att[:,4].unsqueeze(1) * rho_hat
+    v = att[:,5].unsqueeze(1) * rho_hat + att[:,4].unsqueeze(1) * rho_hat_dot
+
+    r = r.float().to(device).requires_grad_()
+    v = v.float().to(device).requires_grad_()
+
+    return r, v
+
+
+# In[36]:
 
 
 # Physical constants and parameters
 AU =  149597870.7 # km per Au
 DAY = 60*60*24 # seconds per day
 
-MU_SUN_KM = 1.32712440018e11  # km³/s² (Sun's gravitational parameter)
-mu = MU_SUN_KM * (DAY**2) / (AU**3)  # Convert to AU³/day² for consistency with the .csv dataset
-
-print(f"Using Solar μ = {mu:.6e} AU³/day² for orbital calculations")
-
-# ===============================================================================  
-# IMPROVED EARTH POSITION CALCULATION FOR ACCURATE NEO RANGES IPORTING
-# ===============================================================================
-
-def get_earth_position_simple(t_mjd: float) -> tuple:
-    """
-    Get approximate Earth position and velocity at given MJD time.
-    Uses simplified circular orbit approximation.
-
-    Args:
-        t_mjd: Modified Julian Date
-
-    Returns:
-        (r_earth, v_earth): Position [AU] and velocity [AU/day] vectors
-    """
-    # Convert MJD to days since J2000.0
-    t_j2000 = t_mjd - 51544.5
-
-    # Earth's mean motion (rad/day) - approximately 2π/365.25
-    n_earth = 2 * np.pi / 365.25
-
-    # Earth's mean anomaly at time t
-    M = n_earth * t_j2000
-
-    # Simplified circular orbit (Earth eccentricity ≈ 0.017, neglected)
-    r_earth = np.array([
-        np.cos(M),      # x component [AU]
-        np.sin(M),      # y component [AU] 
-        0.0             # z component [AU]
-    ])
-
-    v_earth = np.array([
-        -n_earth * np.sin(M),   # vx [AU/day]
-        n_earth * np.cos(M),    # vy [AU/day]
-        0.0                     # vz [AU/day]
-    ])
-
-    return r_earth, v_earth
-
-
-# In[25]:
-
-
-# ===============================================================================
-# DATA LOADING AND PREPROCESSING
-# ===============================================================================
+MU_SUN = 1.32712440018e11  # km³/s² (Sun's gravitational parameter)
+mu = MU_SUN * (DAY**2) / (AU**3)  # Convert to AU³/day² for consistency with the .csv dataset
 
 # Reference time for observations (MJD)
 T_0_MJD = 60800.0
 t_0 = torch.tensor([T_0_MJD], dtype=torch.float32, device=device)
 
+print(f"Using Solar μ = {mu:.6e} AU³/day² for orbital calculations")
 
-def load_dataset_from_csv(filepath: str) -> tuple:
+# ===============================================================================  
+# EARTH POSITION CALCULATION FOR ACCURATE NEO RANGES IMPORTING AND PROCESSING
+# ===============================================================================
+
+def get_earth_position(t, posvel_table=True, numpy_export=False):
     """
-    Load NEO dataset from CSV file and convert to PyTorch tensors.
+    Fast lookup for Earth's heliocentric position/velocity at time t (MJD) using precomputed table.
+    Accepts PyTorch tensors, floats, or numpy arrays. Returns torch tensors by default, or numpy arrays IF numpy_export=True.
+    """
+
+    if posvel_table:  # Precomputed Earth position/velocity table
+        t = t.to(earth_times_tensor.device).flatten().double()
+        earth_times = earth_times_tensor.double()
+        # Clamp t to valid range
+        t = torch.clamp(t, earth_times[0], earth_times[-1])
+        # Find indices for interpolation
+        idx_upper = torch.searchsorted(earth_times, t, right=True)
+        idx_lower = torch.clamp(idx_upper - 1, 0, earth_times.shape[0] - 2)
+        idx_upper = torch.clamp(idx_upper, 1, earth_times.shape[0] - 1)
+        t0 = earth_times[idx_lower]
+        t1 = earth_times[idx_upper]
+        w = (t - t0) / (t1 - t0 + 1e-12)
+        w = w.unsqueeze(-1)
+        # Linear interpolation
+        pos0 = earth_pos_tensor[idx_lower]
+        pos1 = earth_pos_tensor[idx_upper]
+        vel0 = earth_vel_tensor[idx_lower]
+        vel1 = earth_vel_tensor[idx_upper]
+        pos = pos0 + w * (pos1 - pos0)
+        vel = vel0 + w * (vel1 - vel0)
+        return pos, vel
+
+    else:  # Use astropy for real-time calculation
+        t_np = torch.as_tensor(t, dtype=torch.float64).numpy()  # Convert to numpy for astropy compatibility
+        times = Time(t_np, format='mjd')
+        earth_cart_pos, earth_cart_vel = get_body_barycentric_posvel('earth', times)
+
+        pos = np.stack([earth_cart_pos.x.to_value(u.AU),earth_cart_pos.y.to_value(u.AU),earth_cart_pos.z.to_value(u.AU)], axis=-1)
+        vel = np.stack([earth_cart_vel.x.to_value(u.AU/u.d),earth_cart_vel.y.to_value(u.AU/u.d),earth_cart_vel.z.to_value(u.AU/u.d)], axis=-1)
+
+        if numpy_export:
+            pos = np.squeeze(pos)
+            vel = np.squeeze(vel)
+            return pos, vel
+        else:
+            pos = torch.from_numpy(pos).to(torch.float32).requires_grad_(True)
+            vel = torch.from_numpy(vel).to(torch.float32).requires_grad_(True)
+            if pos.shape[0] == 1:
+                pos = pos.squeeze(0)
+                vel = vel.squeeze(0)
+            return pos, vel
+
+def geocentric_to_heliocentric(r_geocentric, v_geocentric, t):
+    """
+    Convert geocentric coordinates to heliocentric coordinates.
 
     Args:
-        filepath: Path to the CSV file
+        r_geocentric: Position vectors in geocentric frame
+        v_geocentric: Velocity vectors in geocentric frame  
+        t: Time tensor
 
     Returns:
-        Tuple of tensors: (t_domain, x_domain, y_domain, t_0, x_0, y_0)
+        r_heliocentric, v_heliocentric: Position and velocity in heliocentric frame
     """
-    try:
-        df = pd.read_csv(filepath)
-        print(f"📄 Successfully loaded {filepath}. Shape: {df.shape}")
-    except FileNotFoundError:
-        print(f"❌ Error: File {filepath} not found.")
-        return tuple(torch.empty(0) for _ in range(6))
 
-    # Column definitions
-    input_cols = ['alpha', 'delta', 'alpha_dot', 'delta_dot']
-    kepler_cols = ['a_kep', 'e', 'i', 'Omega', 'omega', 'M']
-    equin_cols = ['a_equ', 'h', 'k', 'p', 'q', 'lambda']
+    # Get Earth's heliocentric position
+    r_earth_helio, v_earth_helio = get_earth_position(t)  # Use time from first column
+    r_earth_helio = r_earth_helio.to(r_geocentric.device)
+    v_earth_helio = v_earth_helio.to(v_geocentric.device)
 
-    # Storage lists
-    data_lists = {
-        't': [], 'x': [], 'y': [],
-        't_0': [], 'x_0': [], 'y_0': []
-    }
+    # Transform to heliocentric frame
+    r_heliocentric = r_geocentric + r_earth_helio
+    v_heliocentric = v_geocentric + v_earth_helio
 
-    # Process each row
-    for idx, row in df.iterrows():
-        try:
-            # Extract data
-            x_features = row[input_cols].values
-            t_fit = row['t_fit']
-
-            # Fix: Convert to numpy arrays properly
-            equin_params = row[equin_cols].values.astype(np.float64)
-            kepler_params = row[kepler_cols].values.astype(np.float64)
-
-            # CRITICAL FIX: Get Earth's position at observation time
-            earth_r, earth_v = get_earth_position_simple(t_fit)
-
-            # Convert to observables WITH EARTH AS OBSERVER
-            va_0 = equinoctial_to_obs(equin_params, r_obs=earth_r, v_obs=earth_v, mu_param=mu)
-            va_true = keplerian_to_obs(kepler_params, r_obs=earth_r, v_obs=earth_v, mu_param=mu)
-
-            # Check for NaN or infinite values
-            if np.any(np.isnan(va_0)) or np.any(np.isnan(va_true)):
-                print(f"⚠️  Warning: NaN values found in row {idx}, skipping")
-                continue
-            if np.any(np.isinf(va_0)) or np.any(np.isinf(va_true)):
-                print(f"⚠️  Warning: Infinite values found in row {idx}, skipping")
-                continue
-            # Check for valid MJD range
-            if not (15020 <= t_fit <= 88069):
-                print(f"⚠️  Skipping row {idx} with invalid MJD: {t_fit}")
-                continue
-            # Check for negative range (physically impossible)
-            if va_0[4] <= 0 or va_true[4] <= 0:
-                print(f"⚠️  Warning: Negative range found in row {idx}, skipping")
-                continue
-
-            # Store data
-            data_lists['x'].append(x_features.tolist())
-            data_lists['t'].append(float(t_fit))
-            data_lists['y'].append([float(va_true[4]), float(va_true[5])])  # rho, rho_dot
-
-            data_lists['x_0'].append([float(va_0[0]), float(va_0[1]), float(va_0[2]), float(va_0[3])])  # angles
-            data_lists['t_0'].append(float(T_0_MJD))
-            data_lists['y_0'].append([float(va_0[4]), float(va_0[5])])  # rho, rho_dot
-
-        except Exception as e:
-            print(f"❌ Error processing row {idx}: {e}")
-            continue
-
-    # Check if data was loaded
-    if len(data_lists['y']) == 0:
-        print("❌ No valid data loaded!")
-        return tuple(torch.empty(0) for _ in range(6))
-
-    print(f"✅ Loaded {len(data_lists['y'])} valid data points")
-
-    # Convert to tensors with debugging
-    tensors = {}
-    for key, data in data_lists.items():
-        try:
-            array = np.array(data, dtype=np.float32)
-            tensors[key] = torch.tensor(array, device=device)
-        except Exception as e:
-            print(f"❌ Error creating tensor for {key}: {e}")
-            tensors[key] = torch.empty(0, device=device)
-
-    return (tensors['t'], tensors['x'], tensors['y'], 
-            tensors['t_0'], tensors['x_0'], tensors['y_0'])
+    return r_heliocentric, v_heliocentric
 
 
-# In[26]:
+# In[37]:
 
 
 # ===============================================================================
@@ -426,28 +388,28 @@ def load_dataset_from_csv(filepath: str) -> tuple:
 '''
 # Characteristic quantities (based NEO typical scales)
 L_c = 1.0e8  # km (typical NEO distance ~100 million km)
-T_c = np.sqrt(L_c**3 / MU_SUN_KM)  # seconds
+T_c = np.sqrt(L_c**3 / MU_SUN)  # seconds
 V_c = L_c / T_c  # km/s
 '''
 
 '''
 # Characteristic quantities (based on lunar orbit)
 L_c = 3.844e5  # km (mean orbital radius of the moon)
-T_c = np.sqrt(L_c**3 / MU_SUN_KM)  # seconds (characteristic time)
+T_c = np.sqrt(L_c**3 / MU_SUN)  # seconds (characteristic time)
 V_c = L_c / T_c  # km/s (characteristic velocity)
 '''
 
 # Characteristic quantities (based on earth orbit)
 L_c = 1.496e8  # km (mean orbital radius of the earth)
-T_c = np.sqrt(L_c**3 / MU_SUN_KM)  # seconds (characteristic time)
+T_c = np.sqrt(L_c**3 / MU_SUN)  # seconds (characteristic time)
 V_c = L_c / T_c  # km/s (characteristic velocity)
 
-mu_dimensionless = (MU_SUN_KM * T_c**2) / (L_c**3)
+mu_dimensionless = (MU_SUN * T_c**2) / (L_c**3)
 
 print(f"Characteristic scales:")
-print(f"  L_c = {L_c:.0e} km")
-print(f"  T_c = {T_c:.0e} s = {T_c/DAY:.2f} days")
-print(f"  V_c = {V_c:.2f} km/s")
+print(f"L_c = {L_c:.0e} km")
+print(f"T_c = {T_c:.0e} s = {T_c/DAY:.2f} days")
+print(f"V_c = {V_c:.2f} km/s")
 
 
 def normalize(inputs: torch.Tensor, export_minmax: bool = False) -> 'torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]':
@@ -510,7 +472,110 @@ def non_dimensionalise(x: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> tup
     return x_nodim, t_nodim, y_nodim
 
 
-# In[27]:
+# In[38]:
+
+
+# ===============================================================================
+# DATA LOADING AND PREPROCESSING
+# ===============================================================================
+
+def load_dataset_from_csv(filepath: str) -> tuple:
+    """
+    Load NEO dataset from CSV file and convert to PyTorch tensors.
+
+    Args:
+        filepath: Path to the CSV file
+
+    Returns:
+        Tuple of tensors: (t_domain, x_domain, y_domain, t_0, x_0, y_0)
+    """
+    try:
+        df = pd.read_csv(filepath)
+        print(f"📄 Successfully loaded {filepath}. Shape: {df.shape}")
+    except FileNotFoundError:
+        print(f"❌ Error: File {filepath} not found.")
+        return tuple(torch.empty(0) for _ in range(6))
+
+    # Column definitions
+    input_cols = ['alpha', 'delta', 'alpha_dot', 'delta_dot']
+    kepler_cols = ['a_kep', 'e', 'i', 'Omega', 'omega', 'M']
+    equin_cols = ['a_equ', 'h', 'k', 'p', 'q', 'lambda']
+
+    # Storage lists
+    data_lists = {
+        't': [], 'x': [], 'y': [],
+        't_0': [], 'x_0': [], 'y_0': []
+    }
+
+    # Process each row
+    for idx, row in df.iterrows():
+        try:
+            # Extract data
+            x_features = row[input_cols].values
+            t_fit = np.round(row['t_fit'], 8)  # Round MJD to 8 decimal places
+
+            # Fix: Convert to numpy arrays properly
+            equin_params = row[equin_cols].values.astype(np.float64)
+            kepler_params = row[kepler_cols].values.astype(np.float64)
+
+            # CRITICAL FIX: Get Earth's position at observation time
+            earth_r, earth_v = get_earth_position(t_fit, posvel_table=False, numpy_export = True)
+
+            # Convert to observables WITH EARTH AS OBSERVER
+            va_0 = equinoctial_to_obs(equin_params, r_obs=earth_r, v_obs=earth_v, mu_param=mu)
+            va_true = keplerian_to_obs(kepler_params, r_obs=earth_r, v_obs=earth_v, mu_param=mu)
+
+            # Check for NaN or infinite values
+            if np.any(np.isnan(va_0)) or np.any(np.isnan(va_true)):
+                print(f"⚠️  Warning: NaN values found in row {idx}, skipping")
+                continue
+            if np.any(np.isinf(va_0)) or np.any(np.isinf(va_true)):
+                print(f"⚠️  Warning: Infinite values found in row {idx}, skipping")
+                continue
+            # Check for valid MJD range
+            if not (15020 <= t_fit <= 88069):
+                print(f"⚠️  Skipping row {idx} with invalid MJD: {t_fit}")
+                continue
+            # Check for negative range (physically impossible)
+            if va_0[4] <= 0 or va_true[4] <= 0:
+                print(f"⚠️  Warning: Negative range found in row {idx}, skipping")
+                continue
+
+            # Store data
+            data_lists['x'].append(x_features.tolist())
+            data_lists['t'].append(float(t_fit))
+            data_lists['y'].append([float(va_true[4]), float(va_true[5])])  # rho, rho_dot
+
+            data_lists['x_0'].append([float(va_0[0]), float(va_0[1]), float(va_0[2]), float(va_0[3])])  # angles
+            data_lists['t_0'].append(float(T_0_MJD))
+            data_lists['y_0'].append([float(va_0[4]), float(va_0[5])])  # rho, rho_dot
+
+        except Exception as e:
+            print(f"❌ Error processing row {idx}: {e}")
+            continue
+
+    # Check if data was loaded
+    if len(data_lists['y']) == 0:
+        print("❌ No valid data loaded!")
+        return tuple(torch.empty(0) for _ in range(6))
+
+    print(f"✅ Loaded {len(data_lists['y'])} valid data points")
+
+    # Convert to tensors with debugging
+    tensors = {}
+    for key, data in data_lists.items():
+        try:
+            array = np.array(data, dtype=np.float32)
+            tensors[key] = torch.tensor(array, device=device)
+        except Exception as e:
+            print(f"❌ Error creating tensor for {key}: {e}")
+            tensors[key] = torch.empty(0, device=device)
+
+    return (tensors['t'], tensors['x'], tensors['y'], 
+            tensors['t_0'], tensors['x_0'], tensors['y_0'])
+
+
+# In[39]:
 
 
 # ===============================================================================
@@ -542,7 +607,7 @@ class FourierEmbedding(nn.Module):
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
 
-# In[28]:
+# In[40]:
 
 
 # ===============================================================================
@@ -551,16 +616,10 @@ class FourierEmbedding(nn.Module):
 
 class PINN_VSA(nn.Module):
     """
-    Physics-Informed Neural Network for Very Short Arc (VSA) orbit determination.
-
-    Coordinate System Handling:
-    - Input attributable elements produce GEOCENTRIC coordinates (Earth-centered)
-    - Physical constraints (energy, angular momentum) computed in HELIOCENTRIC frame
-    - All coordinate transformations handled consistently
+    Physics-Informed Neural Network for Very Short Arc (VSA) orbit determination
     """
-
     def __init__(self, layers: list, loss_type: str, n_batch: int, mu: float, 
-                 t0_mjd: float, *data, fourier_m: int, fourier_scale: float, corners: list):
+                 t0_mjd: float, fourier_m: int, fourier_scale: float, corners: list, *data):
         """
         Initialize PINN_VSA model.
 
@@ -603,8 +662,9 @@ class PINN_VSA(nn.Module):
 
     def _setup_data_loaders(self, t_domain, x_domain, y_domain, t0, x0, y0, corners: list):
         """Setup data loaders for training, validation, and initial conditions."""
+
         self.n_data = len(t_domain)
-        n_train = max(1, int(0.6 * self.n_data))  # 60% for training
+        n_train = max(1, int(0.7 * self.n_data))  # 70% for training
 
         # Training data
         self.train_dataset = TensorDataset(
@@ -630,6 +690,7 @@ class PINN_VSA(nn.Module):
 
     def _setup_network_layers(self, layers):
         """Setup network layers with factorized weights for better optimization."""
+
         self.layers = nn.ModuleList()
         self.activation = nn.Tanh()
 
@@ -665,13 +726,13 @@ class PINN_VSA(nn.Module):
 
     def _setup_training_config(self):
         """Setup training configuration and loss weighting."""
+
         self.optimizer = None
         self.train_loss_history = []
 
         # Loss weighting parameters
-        self.n_losses = 5  # IC, PDE, residual, interstellar, surface_revolution
+        self.n_losses = 4  # IC, PDE, interstellar, negative_rho (residual, surface_revolution)
         self.loss_weights = torch.ones(self.n_losses, device=device, requires_grad=False)
-        self.f = 20  # Frequency for weight updates
         self.alpha = 0.91  # Exponential moving average factor
 
 
@@ -758,6 +819,9 @@ class PINN_VSA(nn.Module):
 
                 if dy_dx_i is not None:
                     dy_dx[:, i] = dy_dx_i.view(-1)
+                else:
+                    dy_dx[:, i] = 0
+
         else:
             # Scalar output: direct gradient
             dy_dx = torch.autograd.grad(
@@ -772,226 +836,131 @@ class PINN_VSA(nn.Module):
         return self.get_derivative(dy_dx, x, n - 1) if n > 1 else dy_dx
 
 
-    def attributable_to_cartesian(self, att): # (alpha, delta, alpha_dot, delta_dot, rho, rho_dot) --> (r, v)
-        """
-        Convert attributable elements to Cartesian coordinates.
+    def get_training_history(self):
+        loss_his = np.array([
+        [
+            x.detach().cpu().item() if isinstance(x, torch.Tensor) and x.numel() == 1
+            else x.detach().cpu().numpy() if isinstance(x, torch.Tensor)
+            else x
+            for x in entry
+        ]
+        for entry in self.train_loss_history
+        ])
+        total_loss, loss_IC, loss_PDE, loss_interstellar, negative_rho_loss, loss_validation = np.split(loss_his, 6, axis=1) # , loss_residual, loss_surface_revolution, 
 
-        Note: This produces GEOCENTRIC coordinates (Earth-centered).
-        For heliocentric calculations, you need to add Earth's position.
-        """
-        # unit line-of-sight
-        cd, sd = torch.cos(att[:,1]), torch.sin(att[:,1])
-        ca, sa = torch.cos(att[:,0]), torch.sin(att[:,0])
-        rho_hat =  torch.stack([cd*ca, cd*sa, sd], dim=1)
-
-        # partials
-        d_rho_hat_dalpha = torch.stack([-cd*sa, cd*ca, torch.zeros_like(sd)], dim=1)
-        d_rho_hat_ddelta = torch.stack([-sd*ca, -sd*sa, cd], dim=1)
-
-        # time-derivative of rho_hat
-        rho_hat_dot = d_rho_hat_dalpha * att[:,2].unsqueeze(1) + d_rho_hat_ddelta * att[:,3].unsqueeze(1)
-
-        # position and velocity (GEOCENTRIC)
-        r = att[:,4].unsqueeze(1) * rho_hat
-        v = att[:,5].unsqueeze(1) * rho_hat + att[:,4].unsqueeze(1) * rho_hat_dot
-
-        r.requires_grad_(True).float().to(device)
-        v.requires_grad_(True).float().to(device)
-
-        return r, v
+        return total_loss, loss_IC, loss_PDE, loss_interstellar, negative_rho_loss, loss_validation
 
 
-    def get_earth_position(self, t): # Get the heliocentric position of the Earth at time t (denormalized and with dimensions)
-        # Create a cache key based on the time values
-        t_key = tuple(t.detach().cpu().numpy().flatten())
+	# ------------------------ Loss functions for the PINN_VSA class --------------------------------------------
+    def negative_rho_penalty(self, rho, penalty_weight=1e3):
+        # Only penalize negative rho values, ignore positive ones
+        negative_mask = (rho < 0)
+        negative_rho = -torch.minimum(rho, torch.zeros_like(rho))
+        if negative_mask.any():
+            if self.losstype == 'mse':
+                loss_negative_rho = penalty_weight * (negative_rho[negative_mask].pow(2)).mean()
+            elif self.losstype == 'logcosh':
+                loss_negative_rho = penalty_weight * self.log_cosh(negative_rho[negative_mask]).mean()
+        else:
+            loss_negative_rho = torch.zeros_like(rho).sum()
 
-        if t_key in self._earth_position_cache:
-
-            return self._earth_position_cache[t_key]
-
-        # Ensure we have valid MJD values
-        #t_mjd = torch.clamp(t_mjd, min=50000.0, max=70000.0)  # Reasonable MJD range
-
-        t_mjd_np = t.detach().cpu().numpy()
-
-        times = Time(t_mjd_np, format='mjd')
-        earth_cart = get_body_barycentric('earth', times) 
-        xyz_au = u.Quantity(
-            [earth_cart.x.to_value(u.au),
-            earth_cart.y.to_value(u.au),
-            earth_cart.z.to_value(u.au)],
-        unit=u.au
-        ).T 
-        xyz = torch.from_numpy(xyz_au.value).to(torch.float32).to(device)
-
-        if xyz.ndim == 3:
-            xyz = xyz.squeeze(0)
-        if xyz.shape[0] != t.shape[0]:
-            xyz = xyz.expand(t.shape[0], -1)
-
-        # Cache the result for future use
-        self._earth_position_cache[t_key] = xyz
-
-        return xyz
+        return loss_negative_rho
 
 
-    def geocentric_to_heliocentric(self, r_geocentric, v_geocentric, t):
-        """
-        Convert geocentric coordinates to heliocentric coordinates.
-
-        Args:
-            r_geocentric: Position vectors in geocentric frame
-            v_geocentric: Velocity vectors in geocentric frame  
-            t: Time tensor
-
-        Returns:
-            r_heliocentric, v_heliocentric: Position and velocity in heliocentric frame
-        """
-
-        # Get Earth's heliocentric position
-        with torch.no_grad():
-            r_earth_helio = self.get_earth_position(t)  # Use time from first column
-            r_earth_helio = r_earth_helio.detach().to(r_geocentric.device)
-
-        # Transform to heliocentric frame
-        r_heliocentric = r_geocentric + r_earth_helio.clone()
-        v_heliocentric = v_geocentric  # Simplified velocity transformation
-
-        return r_heliocentric, v_heliocentric
-
-
-    # ------------------------ Loss functions for the PINN_VSA class --------------------------------------------
-    def negative_rho_penalty(self, out, penalty_weight=1e4): # inputs denormalized
-        out[:,0] = (out[:,0] * L_c) / AU
-        negative_rho = -torch.minimum(out[:, 0], torch.tensor(0.0, device=out.device))
-
-        return penalty_weight * torch.mean(negative_rho)
-
-
-    def loss_IC(self, x, t, y): # inputs NOT denormalized and dimensionless
+    def loss_IC(self, x, t, y): 
         y_pred_IC = self.network_prediction(t, x)
 
         y_pred_IC = denormalize(y_pred_IC, self.y_border[0], self.y_border[1])
         y = denormalize(y, self.y_border[0], self.y_border[1])
 
-        # Dimensionalization
         y_pred_IC[:,0] = (y_pred_IC[:,0] * L_c) / AU
         y_pred_IC[:,1] = (y_pred_IC[:,1] * V_c) * (DAY / AU)
-
         y[:,0] = (y[:,0] * L_c) / AU
         y[:,1] = (y[:,1] * V_c) * (DAY / AU)
 
         if self.losstype == 'mse':
-            loss_IC = torch.mean(torch.pow((y - y_pred_IC),2))
+            loss_IC = ((y - y_pred_IC).pow(2)).mean()
         elif self.losstype == 'logcosh':
-            loss_IC = torch.mean(self.log_cosh(y - y_pred_IC))
+            loss_IC = (self.log_cosh(y - y_pred_IC)).mean()
 
-        penalty = self.negative_rho_penalty(y_pred_IC)
+        return loss_IC
 
-        return loss_IC + penalty
-
-
-    def loss_residuals(self, out, batch_y): # out denormalized , batch_y NOT denormalized and dimensionless
-        """Compute residual loss using cached network output."""
+    '''
+    def loss_residuals(self, out, batch_y):        
         batch_y = denormalize(batch_y, self.y_border[0], self.y_border[1])
 
-        # Dimensionalization
         batch_y[:,0] = (batch_y[:,0] * L_c) / AU
         batch_y[:,1] = (batch_y[:,1] * V_c) * (DAY / AU)
 
-        out[:,0] = (out[:,0] * L_c) / AU
-        out[:,1] = (out[:,1] * V_c) * (DAY / AU)
+        if self.losstype == 'mse':
+            loss_residual = ((batch_y - out).pow(2)).mean()
+        elif self.losstype == 'logcosh':
+            loss_residual = (self.log_cosh(batch_y - out)).mean()
+
+        return loss_residual
+
+
+
+    def loss_surface_revolution(self, att, r_helio, t):
+        r_earth_helio, _ = get_earth_position(t)
+        r_earth_helio = r_earth_helio.to(r_helio.device)
+
+        r_helio_norm = r_helio.norm(dim=1, keepdim=True)
+        r_earth_norm = r_earth_helio.norm(dim=1, keepdim=True)
+        f = att[:, 4:5].pow(2) - r_helio_norm.pow(2) - (2 * r_earth_norm.pow(5))/(3 * r_helio_norm.pow(3)) + (5/3)*r_earth_norm.pow(2)
 
         if self.losstype == 'mse':
-            loss_residual = torch.mean(torch.pow((batch_y - out), 2))
+            loss_sr = (f.pow(2)).mean()
         elif self.losstype == 'logcosh':
-            loss_residual = torch.mean(self.log_cosh(batch_y - out))
+            loss_sr = self.log_cosh(f).mean()
 
-        penalty = self.negative_rho_penalty(out)
+        return loss_sr
+    '''
 
-        return loss_residual + penalty
-
-
-    def loss_physics(self, r_helio, v_helio, batch_t): # inputs denormalized and with dimensions
-        # Ensure r_helio and v_helio are on the same device
-        r_helio = r_helio.to(device)
-        v_helio = v_helio.to(device)
-
-        # Energy conservation
+    def loss_physics(self, r_helio, v_helio, batch_t):        
         dv_dt = self.get_derivative(v_helio, batch_t, 1)
-
-        if dv_dt is None:
-            dv_dt = torch.zeros_like(v_helio).requires_grad_(True)
-
-        vr = (v_helio * dv_dt).sum(dim=1)
-        rv = (r_helio * v_helio).sum(dim=1)
+        v_vdot = (v_helio * dv_dt).sum(dim=1)
+        r_v = (r_helio * v_helio).sum(dim=1)
         rnorm3 = torch.pow(r_helio.norm(dim=1), 3)
+        dE_dt = v_vdot + mu * (r_v / (rnorm3 + 1e-9)) # Specific orbital energy variation with time
 
-        dE_dt = vr - mu * (rv / (rnorm3 + 1e-8))
-
-        # Angular momentum conservation
         L = torch.cross(r_helio, v_helio, dim=1)
-        dL_dt = self.get_derivative(L, batch_t, 1)
+        dL_dt = self.get_derivative(L, batch_t, 1) # Angular momentum derivative
 
-        if dL_dt is None:
-            dL_dt = torch.zeros_like(L).requires_grad_(True)
-
-        # Combine losses
         if self.losstype == 'mse':
-            loss_PDE = torch.mean(torch.pow(dE_dt, 2)) + torch.mean(torch.pow(dL_dt, 2))
+            loss_PDE = (dE_dt.pow(2) + dL_dt.norm(dim=1).pow(2)).mean()
         elif self.losstype == 'logcosh':
-            loss_PDE = torch.mean(self.log_cosh(dE_dt)) + torch.mean(self.log_cosh(dL_dt))
+            loss_PDE = (self.log_cosh(dE_dt) + self.log_cosh(dL_dt.norm(dim=1))).mean()
 
         return loss_PDE
 
 
-    def loss_surface_revolution(self, att, r_helio, t): # inputs denormalized and with dimensions
-        """Compute surface revolution loss using cached coordinates."""
-        with torch.no_grad():            
-            r_earth_helio = self.get_earth_position(t)  # Use time from first column
-            r_earth_helio = r_earth_helio.detach().to(r_helio.device)
-
-        # To be absolutely sure, let's clone r_helio to ensure we're not modifying a tensor needed elsewhere
-        r_helio_clone = r_helio.clone()
-
-        # Surface revolution constraint in heliocentric frame
-        f = att[:, 4].unsqueeze(1).pow(2) - r_helio_clone.norm(dim=1, keepdim=True).pow(2) - \
-            (2 * r_earth_helio.norm(dim=1, keepdim=True).pow(5))/(3 * r_helio_clone.norm(dim=1, keepdim=True).pow(3)) \
-                + (5/3)*r_earth_helio.norm(dim=1, keepdim=True).pow(2)
-
-        if self.losstype == 'mse':
-            loss_sr = torch.mean(torch.pow(f, 2))
-        elif self.losstype == 'logcosh':
-            loss_sr = torch.mean(self.log_cosh(f))
-
-        out = torch.stack([att[:, 4], att[:, 5]], dim=1) # Already denormalized rho to original scale
-        penalty = self.negative_rho_penalty(out)
-
-        return loss_sr + penalty
-
-
-    def loss_interstellar(self, r_helio, v_helio): # inputs denormalized and with dimensions
-        """Compute interstellar penalty using cached coordinates."""
-        v2 = (torch.pow(v_helio, 2)).sum(dim=1)
+    def loss_interstellar(self, r_helio, v_helio):        
+        v2 = (v_helio ** 2).sum(dim=1)
         rnorm = r_helio.norm(dim=1)
-
-        E = 0.5 * v2 - mu / (rnorm + 1e-8)
+        E = 0.5 * v2 - mu / (rnorm + 1e-9)  # Specific orbital energy
 
         penalty_interstellar = torch.relu(E)
 
-        return penalty_interstellar.mean()
+        if self.losstype == 'mse':
+            loss_sr = (penalty_interstellar.pow(2)).mean()
+        elif self.losstype == 'logcosh':
+            loss_sr = self.log_cosh(penalty_interstellar).mean()
+
+        return loss_sr
 
 
+	# --------------------------------- Losses aggregation functions ---------------------------------
     def losses_epoch(self, use_mixed_precision=False):
         """
         Device-agnostic optimized loss computation with optional mixed precision.
         """
-        losses = {'IC': 0.0, 'PDE': 0.0, 'residual': 0.0, 
-                 'interstellar': 0.0, 'surface_revolution': 0.0, 'validation': 0.0}
+        losses = {'IC': 0.0, 'PDE': 0.0, 'residual': 0.0, 'interstellar': 0.0, 
+                  'surface_revolution': 0.0, 'negative_rho': 0.0, 'validation': 0.0}
 
         # Compute IC loss with optional autocast
         for batch in self.ic_loader:
-            batch = [b.to(device, non_blocking=True) for b in batch]
+            batch = [b.to(device, non_blocking=True).requires_grad_(True) for b in batch]
 
             if use_mixed_precision:
                 with torch.cuda.amp.autocast():
@@ -1004,8 +973,7 @@ class PINN_VSA(nn.Module):
 
         # Compute training losses with coordinate caching
         for batch in self.train_loader:
-            batch_x, batch_t, batch_y = [b.to(device, non_blocking=True) for b in batch]
-            batch_t.requires_grad_(True)
+            batch_x, batch_t, batch_y = [b.to(device, non_blocking=True).requires_grad_(True) for b in batch]
 
             if use_mixed_precision:
                 with torch.cuda.amp.autocast():
@@ -1014,17 +982,16 @@ class PINN_VSA(nn.Module):
             else:
                 losses_batch = self.losses_batch(batch_x, batch_t, batch_y)
 
-            for key in ['PDE', 'residual', 'interstellar', 'surface_revolution']:
+            for key in ['PDE', 'interstellar', 'negative_rho']: # 'residual',  'surface_revolution',
                 losses[key] += losses_batch[key]
 
         if len(self.train_loader) > 0:
-            for key in ['PDE', 'residual', 'interstellar', 'surface_revolution']:
+            for key in ['PDE', 'interstellar', 'negative_rho']: # 'residual',  'surface_revolution',
                 losses[key] /= len(self.train_loader)
 
         # Compute validation loss
         for batch in self.valid_loader:
-            batch_x, batch_t, batch_y = [b.to(device, non_blocking=True) for b in batch]
-            batch_t.requires_grad_(True)  # This needs gradients for PDE loss computation
+            batch_x, batch_t, batch_y = [b.to(device, non_blocking=True).requires_grad_(True) for b in batch]
 
 			# Use torch.no_grad() only for the final loss computation to save memory but allow gradients for intermediate calculations
             if use_mixed_precision:
@@ -1038,11 +1005,12 @@ class PINN_VSA(nn.Module):
         if len(self.valid_loader) > 0:
             losses['validation'] /= len(self.valid_loader)
 
+        losses['validation'] += self.loss_weights[0].clone()*losses['IC']  # Include IC loss in validation
+
         return losses
 
 
     def losses_batch(self, batch_x, batch_t, batch_y): # inputs NOT denormalized
-        """Compute all losses for a batch with coordinate caching."""
         # We need a separate graph for the surface revolution loss to avoid conflicts with the derivatives taken in the PDE loss.
         out_pde = self.network_prediction(batch_t, batch_x)
         out_sr = self.network_prediction(batch_t, batch_x)
@@ -1052,68 +1020,78 @@ class PINN_VSA(nn.Module):
         out_pde = denormalize(out_pde, self.y_border[0], self.y_border[1])
         out_sr = denormalize(out_sr, self.y_border[0], self.y_border[1])
 
+        batch_x[:,2] = (batch_x[:,2] / T_c) * DAY
+        batch_x[:,3] = (batch_x[:,3] / T_c) * DAY
+        out_pde[:,0] = (out_pde[:,0] * L_c) / AU
+        out_pde[:,1] = (out_pde[:,1] * V_c) * (DAY / AU)
+        out_sr[:,0] = (out_sr[:,0] * L_c) / AU
+        out_sr[:,1] = (out_sr[:,1] * V_c) * (DAY / AU)
+
         att_pde = torch.cat([batch_x, out_pde], dim=1)
-        att_sr = torch.cat([batch_x, out_sr], dim=1)
-
-        # Dimensionalization
-        att_pde[:,2] = (att_pde[:,2] / T_c) * DAY
-        att_pde[:,3] = (att_pde[:,3] / T_c) * DAY
-
-        att_sr[:,2] = (att_sr[:,2] / T_c) * DAY
-        att_sr[:,3] = (att_sr[:,3] / T_c) * DAY
+        #att_sr = torch.cat([batch_x, out_sr], dim=1)
 
         batch_t = self.t0_mjd + ((batch_t * T_c) / DAY) # Convert to seconds --> Convert to days --> Add to reference MJD
 
-        r_geocentric_pde, v_geocentric_pde = self.attributable_to_cartesian(att_pde)
-        r_helio_pde, v_helio_pde = self.geocentric_to_heliocentric(r_geocentric_pde, v_geocentric_pde, batch_t)
+        r_geocentric_pde, v_geocentric_pde = attributable_to_cartesian(att_pde)
+        r_helio_pde, v_helio_pde = geocentric_to_heliocentric(r_geocentric_pde, v_geocentric_pde, batch_t)
 
-        r_geocentric_sr, v_geocentric_sr = self.attributable_to_cartesian(att_sr)
-        r_helio_sr, v_helio_sr = self.geocentric_to_heliocentric(r_geocentric_sr, v_geocentric_sr, batch_t)
+        #r_geocentric_sr, v_geocentric_sr = attributable_to_cartesian(att_sr)
+        #r_helio_sr, _ = geocentric_to_heliocentric(r_geocentric_sr, v_geocentric_sr, batch_t)
 
-        # Compute all losses using cached coordinates allowing all losses to remain connected to the same computation graph
+        # Allowing all losses to remain connected to the same computation graph
         out_sr = out_pde
-        att_sr = att_pde
-        r_helio_sr = r_helio_pde
+        #att_sr = att_pde
+        #r_helio_sr = r_helio_pde
 
         return {
             'PDE': self.loss_physics(r_helio_pde, v_helio_pde, batch_t),
-            'residual': self.loss_residuals(out_sr, batch_y),
+            #'residual': self.loss_residuals(out_sr, batch_y),
             'interstellar': self.loss_interstellar(r_helio_pde, v_helio_pde),
-            'surface_revolution': self.loss_surface_revolution(att_sr, r_helio_sr, batch_t),
+            #'surface_revolution': self.loss_surface_revolution(att_sr, r_helio_sr, batch_t),
+            'negative_rho': self.negative_rho_penalty(out_sr[:, 0])
         }
 
 
     def validation_loss_batch(self, batch_x, batch_t, batch_y): # inputs NOT denormalized
         """Compute validation loss for a batch using cached coordinate computation."""
-        # Single forward pass
-        out = self.network_prediction(batch_t, batch_x)
+        with torch.no_grad():
+            # Single forward pass
+            out = self.network_prediction(batch_t, batch_x)
 
-        batch_t_denorm = denormalize(batch_t, self.t_border[0], self.t_border[1])  # Denormalize time to original scale
-        batch_x_denorm = denormalize(batch_x, self.x_border[0], self.x_border[1])  # Denormalize x to original scale
-        out = denormalize(out, self.y_border[0], self.y_border[1])
+            batch_t_denorm = denormalize(batch_t, self.t_border[0], self.t_border[1])  # Denormalize time to original scale
+            batch_x_denorm = denormalize(batch_x, self.x_border[0], self.x_border[1])  # Denormalize x to original scale
+            out = denormalize(out, self.y_border[0], self.y_border[1])
 
-        att = torch.cat([batch_x_denorm, out], dim=1)
+            batch_x_denorm[:,2] = (batch_x_denorm[:,2] / T_c) * DAY
+            batch_x_denorm[:,3] = (batch_x_denorm[:,3] / T_c) * DAY
+            out[:,0] = (out[:,0] * L_c) / AU
+            out[:,1] = (out[:,1] * V_c) * (DAY / AU)
 
-        att[:,2] = (att[:,2] / T_c) * DAY
-        att[:,3] = (att[:,3] / T_c) * DAY
+            att = torch.cat([batch_x_denorm, out], dim=1)
 
-        batch_t_standard = self.t0_mjd + ((batch_t_denorm * T_c) / DAY)
+            batch_t_standard = self.t0_mjd + ((batch_t_denorm * T_c) / DAY)
 
-        # Get coordinates once and cache
-        r_geocentric, v_geocentric = self.attributable_to_cartesian(att)
-        r_helio, v_helio = self.geocentric_to_heliocentric(r_geocentric, v_geocentric, batch_t_standard)
+            # Get coordinates once and cache
+            r_geocentric, v_geocentric = attributable_to_cartesian(att)
+            r_helio, v_helio = geocentric_to_heliocentric(r_geocentric, v_geocentric, batch_t_standard)
 
-        # Compute all losses using cached coordinates
-        ic_loss = self.loss_weights[0].clone()*self.loss_IC(batch_x, batch_t, batch_y)
+            # Compute all losses that do not need grad
+            #residual_loss = self.loss_weights[2].clone()*self.loss_residuals(out, batch_y)
+            interstellar_loss = self.loss_weights[2].clone()*self.loss_interstellar(r_helio, v_helio)
+            #surface_revolution_loss = self.loss_weights[4].clone()*self.loss_surface_revolution(att, r_helio, batch_t_standard)
+            negative_rho_loss = self.loss_weights[3].clone()*self.negative_rho_penalty(out[:, 0])  
+
+        # For pde_loss, use fresh tensors with requires_grad=True
+        batch_t_standard = batch_t_standard.clone().detach().requires_grad_(True)
+        r_helio = r_helio.clone().detach().requires_grad_(True)
+        v_helio = v_helio.clone().detach().requires_grad_(True)
+
         pde_loss = self.loss_weights[1].clone()*self.loss_physics(r_helio, v_helio, batch_t_standard)
-        residual_loss = self.loss_weights[2].clone()*self.loss_residuals(out, batch_y)
-        interstellar_loss = self.loss_weights[3].clone()*self.loss_interstellar(r_helio, v_helio)
-        surface_revolution_loss = self.loss_weights[4].clone()*self.loss_surface_revolution(att, r_helio, batch_t_standard)
 
-        return ic_loss + pde_loss + residual_loss + interstellar_loss + surface_revolution_loss
+        return pde_loss + interstellar_loss + negative_rho_loss #+ residual_loss + surface_revolution_loss
 
 
-    #--------------------------------------------------------------------------------------------------------
+    #----------------------------- Global loss weights update ----------------------------------------------
     '''
     def forward_temp_weights(self, loss_domain):
         loss_domain = torch.tensor(loss_domain, device=self.temporal_weights.device)
@@ -1127,18 +1105,12 @@ class PINN_VSA(nn.Module):
         # Create the gradient of each component of the loss respect to the parameters of the model
         grad_norms = []
 
-        for i, l in enumerate(losses): 
-            # Create a fresh copy that's detached from the original graph
-            l_copy = l.detach().clone().requires_grad_(True)
-
-            # Use retain_graph=True for all but the last loss to avoid freeing the graph
-            retain_graph = (i < len(losses) - 1)
-
+        for l in losses:
             grads = torch.autograd.grad(
-                l_copy, parameters, 
-                retain_graph=retain_graph, 
-                create_graph=False,  # Changed to False to avoid creating new graph
-                allow_unused=True
+                l, parameters, 
+                retain_graph=True, 
+                create_graph=False,  # Avoid creating new graph
+                allow_unused=False
             )
 
             flat = []
@@ -1158,19 +1130,12 @@ class PINN_VSA(nn.Module):
         self.loss_weights = self.alpha*self.loss_weights.clone() + (1 - self.alpha)*lambda_hat
 
 
-    def get_training_history(self):
-        loss_his = np.array(self.train_loss_history)
-        total_loss, loss_IC, loss_PDE, loss_residual, loss_interstellar, loss_surface_revolution, loss_validation = np.split(loss_his, 7, axis=1) 
-
-        return total_loss, loss_IC, loss_PDE, loss_residual, loss_interstellar, loss_surface_revolution, loss_validation
-
-
     # ---------------------------------------------- Training routine ---------------------------------------------------
     def train_network(self, epochs: int, learning_rate: float, regularization: float,
                      gradient_accumulation_steps: int, early_stopping_patience: int, 
                      log_interval: int, use_mixed_precision: bool = False):
         """
-        Device-agnostic optimized training loop with automatic mixed precision support.
+        Training loop with automatic mixed precision support.
 
         Args:
             epochs: Number of training epochs
@@ -1181,6 +1146,8 @@ class PINN_VSA(nn.Module):
             log_interval: How often to update progress bar
             use_mixed_precision: Enable mixed precision (auto-detected if None)
         """
+        self.f = max(10, epochs // 100)  # Update frequency for loss weights
+
         # Auto-detect mixed precision capability
         if use_mixed_precision is None:
             use_mixed_precision = device.type == 'cuda' and torch.cuda.is_available()
@@ -1204,7 +1171,7 @@ class PINN_VSA(nn.Module):
         self.optimizer = torch.optim.AdamW(self.new_param, **optimizer_kwargs)
 
         # Advanced learning rate scheduling
-        warmup_steps = min(300, epochs // 10)
+        warmup_steps = min(300, epochs // 5)
         cosine_lr = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=epochs, eta_min=int(learning_rate * 0.01)
         )
@@ -1236,9 +1203,10 @@ class PINN_VSA(nn.Module):
             weighted_losses = self.loss_weights.clone() * torch.stack([
                 torch.as_tensor(losses['IC'], device=device, dtype=torch.float32),
                 torch.as_tensor(losses['PDE'], device=device, dtype=torch.float32),
-                torch.as_tensor(losses['residual'], device=device, dtype=torch.float32),
+                #torch.as_tensor(losses['residual'], device=device, dtype=torch.float32),
                 torch.as_tensor(losses['interstellar'], device=device, dtype=torch.float32),
-                torch.as_tensor(losses['surface_revolution'], device=device, dtype=torch.float32)
+                #torch.as_tensor(losses['surface_revolution'], device=device, dtype=torch.float32),
+                torch.as_tensor(losses['negative_rho'], device=device, dtype=torch.float32)
             ])
 
             total_loss = weighted_losses.sum()
@@ -1250,8 +1218,14 @@ class PINN_VSA(nn.Module):
 
             self.optimizer.zero_grad()
 
-            # Backward pass with optional mixed precision
-            if use_mixed_precision and scaler is not None:
+            # Update loss weights periodically
+            if (epoch % (self.f) == 0):
+                # Compute loss weights without interfering with main training graph
+                self.forward_loss_weights([losses['IC'], losses['PDE'], losses['interstellar'], 
+                                            losses['negative_rho']]) # losses['residual'], losses['surface_revolution'],
+
+            # ------ BACKWARD PASS ------
+            if use_mixed_precision and scaler is not None: # with optional mixed precision
                 scaler.scale(total_loss).backward()
                 if (epoch + 1) % gradient_accumulation_steps == 0:
                     scaler.unscale_(self.optimizer)
@@ -1259,25 +1233,22 @@ class PINN_VSA(nn.Module):
                     scaler.step(self.optimizer)
                     scaler.update()
                     self.scheduler.step()
-            else:
-                # --- MODIFIED BACKWARD PASS: separate the losses that require complex graphs (PDE) from simpler ones
-                # First: Complex losse that involve derivatives (PDE)
+            else: 
+                '''
+                # separate the losses that require complex graphs (PDE) from simpler ones
+                # First: Complex loss that involve derivatives (PDE)
                 complex_losses = weighted_losses[1] 
                 complex_losses.backward(retain_graph=True)
-
                 # Second: Simple losses (IC, residual, interstellar, surface_revolution)
-                simple_losses = weighted_losses[0] + weighted_losses[2] + weighted_losses[3] + weighted_losses[4] 
+                simple_losses = weighted_losses[0] + weighted_losses[2] + weighted_losses[3] + weighted_losses[4] + weighted_losses[5]
                 simple_losses.backward()
+                '''
+                total_loss.backward()
 
                 if (epoch + 1) % gradient_accumulation_steps == 0:
                     torch.nn.utils.clip_grad_norm_(self.new_param, max_norm=1.0)
                     self.optimizer.step()
                     self.scheduler.step()
-
-            # Update loss weights periodically
-            if epoch % (self.f) == 0:
-                # Compute loss weights without interfering with main training graph
-                self.forward_loss_weights([losses['IC'], losses['PDE'], losses['residual'], losses['interstellar'], losses['surface_revolution']])
 
             # Validation and early stopping
             val_loss = float(losses['validation'])
@@ -1294,10 +1265,11 @@ class PINN_VSA(nn.Module):
                 break
 
             # Efficient history logging
+
             if epoch % max(1, epochs // 200) == 0:
-                history_entry = ([torch.as_tensor(total_loss).cpu().detach()] +
-                                [torch.as_tensor(wl).cpu().detach() for wl in weighted_losses] +
-                                [torch.as_tensor(losses['validation']).cpu().detach()])
+                history_entry = ([total_loss.detach().cpu().item() if isinstance(total_loss, torch.Tensor) else total_loss] +
+                    [wl.detach().cpu().item() if isinstance(wl, torch.Tensor) else wl for wl in weighted_losses] +
+                    [losses['validation'].detach().cpu().item() if isinstance(losses['validation'], torch.Tensor) else losses['validation']])
                 self.train_loss_history.append(history_entry)
 
             # Performance tracking
@@ -1345,11 +1317,11 @@ class PINN_VSA(nn.Module):
         return total_training_time
 
 
-# In[29]:
+# In[41]:
 
 
 # ===============================================================================
-# DATA LOADING AND PREPROCESSING
+# DATA LOADING AND PRE-PROCESSING
 # ===============================================================================
 
 print("Loading and pre-processing data...")
@@ -1385,7 +1357,43 @@ y0_true = normalize(y0_true)
 print("Data pre-processing complete.")
 
 
-# In[30]:
+# In[ ]:
+
+
+# ===============================================================================
+# PRE-COMPUTE EARTH POSITION AND VELOCITY TABLE
+# ===============================================================================
+
+all_times = torch.cat([t_allN.to(torch.float64).flatten(), t_0_long.to(torch.float64).flatten()])
+unique_times, unique_indices = torch.unique(all_times, sorted=True, return_inverse=True)
+unique_times = unique_times.cpu().numpy()  # Astropy needs numpy for ephemeris
+
+if len(unique_times) > 0:
+    times = Time(unique_times, format='mjd')
+    earth_cart_pos, earth_cart_vel = get_body_barycentric_posvel('earth', times)
+    xyz_au = np.stack([
+        earth_cart_pos.x.to_value(u.AU),
+        earth_cart_pos.y.to_value(u.AU),
+        earth_cart_pos.z.to_value(u.AU)
+    ], axis=-1)
+    v_xyz_au_day = np.stack([
+        earth_cart_vel.x.to_value(u.AU/u.d),
+        earth_cart_vel.y.to_value(u.AU/u.d),
+        earth_cart_vel.z.to_value(u.AU/u.d)
+    ], axis=-1)
+
+    # Convert to torch tensors (shape: [N_unique, 3])
+    earth_times_tensor = torch.from_numpy(unique_times).to(torch.float64).to(device)
+    earth_pos_tensor = torch.from_numpy(xyz_au).float().to(device)
+    earth_vel_tensor = torch.from_numpy(v_xyz_au_day).float().to(device)
+
+else:
+    earth_times_tensor = torch.empty(0, dtype=torch.float64, device=device)
+    earth_pos_tensor = torch.empty(0, 3, dtype=torch.float32, device=device)
+    earth_vel_tensor = torch.empty(0, 3, dtype=torch.float32, device=device)
+
+
+# In[ ]:
 
 
 # ===============================================================================
@@ -1393,25 +1401,25 @@ print("Data pre-processing complete.")
 # ===============================================================================
 
 # Network architecture
-layers = [5, 256, 256, 256, 256, 256, 2]  # [input_features, ...hidden_layers..., output_features]
+layers = [5, 128, 128, 128, 128, 128, 2]        # [input_features, ...hidden_layers..., output_features]
 
-epochs = 1000  # Number of training epochs
-lr = 1e-5  # Learning rate for optimizer
+epochs = 1000 # number of training epochs
+lr = 1e-5  # learning rate for optimizer
 
 # Device-aware training configuration
 config = {
-    'loss_type': 'mse',                    # 'mse' or 'logcosh'
+    'loss_type': 'logcosh',                    # 'mse' or 'logcosh'
     'epochs': epochs,                      # Number of training epochs  
     'learning_rate': lr,                   # Learning rate for optimizer
     'regularization': lr*0,                # L2 regularization for stability
-    'fourier_features': 8,                 # Fourier embedding size
+    'fourier_features': 16,                # Fourier embedding size
     'fourier_scale': 2.0,                  # Fourier embedding scale
 
     # Device-aware optimization parameters
-    'batch_size': 32,
+    'batch_size': 64,
     'gradient_accumulation_steps': 1 if device.type == 'cuda' else 2,     # More accumulation for CPU
-    'early_stopping_patience': epochs//3,                                 # Early stopping patience
-    'log_interval': epochs//20,                                           # More frequent updates on GPU
+    'early_stopping_patience': epochs,                                 # Early stopping patience
+    'log_interval': max(epochs//20, 1),                                           # More frequent updates on GPU
     'use_mixed_precision': None,                                          # Auto-detect mixed precision
 }
 
@@ -1430,11 +1438,11 @@ model = PINN_VSA(
     config['batch_size'],
     mu,
     T_0_MJD,
-    t0, x0, y0_true,           # Initial conditions
-    t_allN_processed, x_allN_processed, y_true_allN_processed, # Training and validation data
-    fourier_m = config['fourier_features'],
-    fourier_scale = config['fourier_scale'],
-    corners = [t_mins, t_maxs, x_mins, x_maxs, y_mins, y_maxs],
+    config['fourier_features'],
+    config['fourier_scale'],
+    [t_mins, t_maxs, x_mins, x_maxs, y_mins, y_maxs],               # corners
+    t_allN_processed, x_allN_processed, y_true_allN_processed,      # domain data
+    t0, x0, y0_true                                  # iniital data
 ).to(device)
 
 print("✅ Model initialization complete.")
@@ -1457,7 +1465,7 @@ training_time = model.train_network(
 print(f"\n🎉 Training completed in {training_time:.2f}s!")
 
 
-# In[31]:
+# In[ ]:
 
 
 # ===============================================================================
@@ -1465,20 +1473,21 @@ print(f"\n🎉 Training completed in {training_time:.2f}s!")
 # ===============================================================================
 
 # Get training history
-(total_loss, loss_IC, loss_PDE, loss_residual, 
- loss_interstellar, loss_surface_revolution, loss_validation) = model.get_training_history()
+(total_loss, loss_IC, loss_PDE,
+ loss_interstellar, negative_rho_loss, loss_validation) = model.get_training_history() # , loss_residual, loss_surface_revolution,
 
 # Create enhanced loss plot
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
 # Main loss plot
 loss_components = [
-    (total_loss, 'Total Loss', 'black', 2.0),
-    (loss_residual, 'Data Residual', 'blue', 1.5),
-    (loss_IC, 'Initial Conditions', 'green', 1.5),
+    (total_loss, 'Total loss', 'black', 2.0),
+    #(loss_residual, 'Residuals', 'cyan', 1.5),
+    (loss_IC, 'Initial conditions', 'green', 1.5),
     (loss_PDE, 'Physics (PDE)', 'red', 1.5),
-    (loss_surface_revolution, 'Surface Revolution', 'orange', 1.5),
-    (loss_interstellar, 'Interstellar Penalty', 'purple', 1.5),
+    #(loss_surface_revolution, 'Surface Revolution', 'orange', 1.5),
+    (loss_interstellar, 'Interstellar penalty', 'purple', 1.5),
+    (negative_rho_loss, r'Negative $\rho$ penalty', 'blue', 1.5),
     (loss_validation, 'Validation', 'gray', 2.0)
 ]
 
@@ -1531,8 +1540,8 @@ if len(total_loss) > 0:
     print(f"  Total Loss: {total_loss[-1].item():.4e}")
     if len(loss_validation) > 0:
         print(f"  Validation Loss: {loss_validation[-1].item():.4e}")
-    if len(loss_residual) > 0:
-        print(f"  Data Residual: {loss_residual[-1].item():.4e}")
+    #if len(loss_residual) > 0:
+    #    print(f"  Data Residual: {loss_residual[-1].item():.4e}")
     if len(loss_PDE) > 0:
         print(f"  Physics Loss: {loss_PDE[-1].item():.4e}")
 
@@ -1549,7 +1558,7 @@ if len(total_loss) > 0:
             print("  🔄 Training still improving - consider more epochs")
 
 
-# In[32]:
+# In[ ]:
 
 
 # Get model predictions on validation set
@@ -1562,7 +1571,6 @@ print(f"Validation targets shape: {model.y_valid.shape}")
 # ===============================================================================
 # HISTOGRAM VISUALIZATION OF VALIDATION RESULTS
 # ===============================================================================
-
 
 # Denormalize predictions and validation data for plotting
 t_valid_np = denormalize(model.t_valid, t_mins, t_maxs).detach().cpu().numpy()
@@ -1640,23 +1648,16 @@ axes[1, 2].grid(True, alpha=0.3)
 plt.tight_layout()
 plt.show()
 
-fig.savefig('Errors_Distribution.png')
-
-
 # Statistical summary of errors
 print(f"\n📊 Detailed Error Analysis:")
 print(f"  Range (ρ) Errors:")
 print(f"    Mean Error: {np.mean(error_rho):.6e}")
 print(f"    Std Error: {np.std(error_rho):.6e}")
-print(f"    Min Error: {np.min(error_rho):.6e}")
-print(f"    Max Error: {np.max(error_rho):.6e}")
 print(f"    Error Range: {np.max(error_rho) - np.min(error_rho):.6e}")
 
 print(f"\n  Range Rate (ρ̇) Errors:")
 print(f"    Mean Error: {np.mean(error_rho_dot):.6e}")
 print(f"    Std Error: {np.std(error_rho_dot):.6e}")
-print(f"    Min Error: {np.min(error_rho_dot):.6e}")
-print(f"    Max Error: {np.max(error_rho_dot):.6e}")
 print(f"    Error Range: {np.max(error_rho_dot) - np.min(error_rho_dot):.6e}")
 
 # Distribution tests
@@ -1676,20 +1677,16 @@ print(f"    p-value: {p_rho_dot_normal:.6f} ({'Normal' if p_rho_dot_normal > 0.0
 print(f"\n📊 Error Percentiles:")
 print(f"  Range (ρ) Error Percentiles:")
 print(f"    5th: {np.percentile(np.abs(error_rho), 5):.6e}")
-print(f"    25th: {np.percentile(np.abs(error_rho), 25):.6e}")
 print(f"    50th (Median): {np.percentile(np.abs(error_rho), 50):.6e}")
-print(f"    75th: {np.percentile(np.abs(error_rho), 75):.6e}")
 print(f"    95th: {np.percentile(np.abs(error_rho), 95):.6e}")
 
 print(f"\n  Range Rate (ρ̇) Error Percentiles:")
 print(f"    5th: {np.percentile(np.abs(error_rho_dot), 5):.6e}")
-print(f"    25th: {np.percentile(np.abs(error_rho_dot), 25):.6e}")
 print(f"    50th (Median): {np.percentile(np.abs(error_rho_dot), 50):.6e}")
-print(f"    75th: {np.percentile(np.abs(error_rho_dot), 75):.6e}")
 print(f"    95th: {np.percentile(np.abs(error_rho_dot), 95):.6e}")
 
 
-# In[33]:
+# In[ ]:
 
 
 # ===============================================================================
@@ -1776,5 +1773,50 @@ print(f"  Relative error: {(rho_dot_error.mean() / np.abs(y_valid_physical[:, 1]
 # In[ ]:
 
 
+# Profiling cell: measure time spent in key sections of the training loop and Earth position lookup
 
+profile_results = {}
+if 'PINN_VSA' in globals():
+    # Profile a single batch from train_loader
+    batch = next(iter(model.train_loader))
+    batch_x, batch_t, batch_y = [b.to(device, non_blocking=True) for b in batch]
+    batch_t.requires_grad_(True)
+
+    # 1. Profile Earth position lookup
+    t0 = time.time()
+    try:
+        # Use the same time format as in your training loop
+        batch_t_denorm = denormalize(batch_t, model.t_border[0], model.t_border[1])
+        batch_t_mjd = model.t0_mjd + ((batch_t_denorm * T_c) / DAY)
+        r_earth, v_earth = get_earth_position(batch_t_mjd)
+    except Exception as e:
+        r_earth, v_earth = None, None
+        print('Earth position lookup failed:', e)
+    t1 = time.time()
+    profile_results['earth_position_lookup'] = t1 - t0
+
+    # 2. Profile forward pass
+    t2 = time.time()
+    out = model.network_prediction(batch_t, batch_x)
+    t3 = time.time()
+    profile_results['forward_pass'] = t3 - t2
+
+    # 3. Profile loss computation (all losses)
+    t4 = time.time()
+    losses = model.losses_batch(batch_x, batch_t, batch_y)
+    t5 = time.time()
+    profile_results['loss_computation'] = t5 - t4
+
+    # 4. Profile backward pass
+    t6 = time.time()
+    total_loss = sum(losses.values()) if isinstance(losses, dict) else losses
+    total_loss.backward()
+    t7 = time.time()
+    profile_results['backward_pass'] = t7 - t6
+
+    print('Profiling results (seconds):')
+    for k, v in profile_results.items():
+        print(f'{k}: {v:.4f}')
+else:
+    print('Model (PINN) not found in globals(). Please run model definition and training setup first.')
 
